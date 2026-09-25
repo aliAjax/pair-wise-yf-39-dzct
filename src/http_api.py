@@ -85,6 +85,18 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "observation-batches"]:
+                    query = parse_qs(parsed.query)
+                    device_id = query.get("device_id", [None])[0]
+                    batch_no = query.get("batch_no", [None])[0]
+                    if not device_id or not batch_no:
+                        raise ValidationError(
+                            "device_id and batch_no query params are required"
+                        )
+                    return self._send(
+                        200,
+                        service.get_observation_batch(device_id, batch_no),
+                    )
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -138,6 +150,11 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
                     )
+                if parts == ["api", "observation-batches"]:
+                    status, response = service.upload_observation_batch(
+                        actor, self._body()
+                    )
+                    return self._send(status, response)
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     idem = self.headers.get("Idempotency-Key")

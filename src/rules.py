@@ -1,4 +1,5 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+import math
 
 from .domain import (
     ConflictError,
@@ -6,6 +7,139 @@ from .domain import (
     PermissionDenied,
     ValidationError,
 )
+
+
+OBSERVATION_CONTENT_FIELDS = ("species", "location", "lat", "lon")
+OBSERVATION_IDENTITY_FIELDS = ("event_id", "observed_at")
+
+
+def _normalize_observed_at(value):
+    text = str(value or "")[:10]
+    try:
+        date.fromisoformat(text)
+    except ValueError:
+        raise ValidationError("observed_at must be a valid date (YYYY-MM-DD)")
+    return text
+
+
+def _coordinate(value, field):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValidationError(field + " must be a number")
+    if math.isnan(number) or math.isinf(number):
+        raise ValidationError(field + " must be a finite number")
+    return number
+
+
+def _prepare_observation_item(raw, seen):
+    """Validate one offline observation and normalise its identity/content.
+
+    Identity is (event_id, observed_at). Content is the set of fields the
+    patrol device owns; anything the duty officer may have corrected is part
+    of content, never silently overwritten.
+    """
+    if not isinstance(raw, dict):
+        raise ValidationError("each observation must be an object")
+    item = dict(raw)
+    RuleEngine._require(item, RuleEngine.CREATE_REQUIRED["observation"])
+    event_id = str(item["event_id"]).strip()
+    observed_at = _normalize_observed_at(item["observed_at"])
+    if not event_id:
+        raise ValidationError("event_id must not be blank")
+    for field in ("species", "location"):
+        if not isinstance(item.get(field), str):
+            raise ValidationError(field + " must be a string")
+    content = {
+        "species": item["species"],
+        "location": item["location"],
+        "lat": _coordinate(item["lat"], "lat"),
+        "lon": _coordinate(item["lon"], "lon"),
+    }
+    lat, lon = content["lat"], content["lon"]
+    if not -90 <= lat <= 90:
+        raise ValidationError("lat must be between -90 and 90")
+    if not -180 <= lon <= 180:
+        raise ValidationError("lon must be between -180 and 180")
+    identity = (event_id, observed_at)
+    if identity in seen:
+        raise ValidationError(
+            "duplicate observation inside batch: event %s at %s" % identity
+        )
+    seen.add(identity)
+    payload = dict(item)
+    payload["event_id"] = event_id
+    payload["observed_at"] = observed_at
+    payload.update(content)
+    return {"identity": identity, "content": content, "payload": payload}
+
+
+def validate_observation_batch_envelope(actor, body):
+    """Validate the batch envelope; never touches storage."""
+    if not isinstance(body, dict):
+        raise ValidationError("request body must be a JSON object")
+    RuleEngine._ensure_role(actor, RuleEngine.CREATE_ROLES["observation"])
+    device_id = body.get("device_id")
+    batch_no = body.get("batch_no")
+    if not device_id or not isinstance(device_id, str):
+        raise ValidationError("device_id is required")
+    if not batch_no or not isinstance(batch_no, str):
+        raise ValidationError("batch_no is required")
+    observations = body.get("observations")
+    if not isinstance(observations, list) or not observations:
+        raise ValidationError("observations must be a non-empty list")
+    return device_id, batch_no, observations
+
+
+def prepare_observations(observations):
+    """Validate and normalise every batch item; returns identity-keyed items."""
+    seen = set()
+    return [_prepare_observation_item(item, seen) for item in observations]
+
+
+def plan_observation_batch(prepared, existing_by_identity):
+    """Classify every item as create/skip/conflict against server state.
+
+    Same identity (event_id + observed_at) means the same observation.
+    Identical content skips; differing content is a whole-batch conflict.
+    """
+    creates, skips, conflicts = [], [], []
+    for item in prepared:
+        event_id, observed_at = item["identity"]
+        current = existing_by_identity.get(item["identity"])
+        if current is None:
+            creates.append(item)
+            continue
+        server_content = {
+            field: (
+                float(current["data"].get(field))
+                if field in ("lat", "lon")
+                else current["data"].get(field)
+            )
+            for field in OBSERVATION_CONTENT_FIELDS
+        }
+        record = {
+            "event_id": event_id,
+            "observed_at": observed_at,
+            "incoming": item["content"],
+            "server_entity_id": current["id"],
+            "server_version": current["version"],
+            "server_status": current["status"],
+            "server": server_content,
+        }
+        if server_content == item["content"]:
+            skips.append(
+                {
+                    "event_id": event_id,
+                    "observed_at": observed_at,
+                    "entity_id": current["id"],
+                    "version": current["version"],
+                    "status": current["status"],
+                }
+            )
+        else:
+            conflicts.append(record)
+    return {"creates": creates, "skips": skips, "conflicts": conflicts}
 
 
 def _validate_observation(actor, data, lookup):

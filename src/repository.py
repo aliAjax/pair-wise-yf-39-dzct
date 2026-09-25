@@ -1,6 +1,7 @@
 import json
 import sqlite3
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from .domain import ConflictError, NotFoundError
 
@@ -54,7 +55,22 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS observation_batches (
+                    device_id TEXT NOT NULL,
+                    batch_no TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    response TEXT NOT NULL,
+                    submitted_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(device_id, batch_no)
+                );
             """)
+
+    def batch_transaction(self):
+        """Single-writer transaction for the batch create/reject decision."""
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        return _BatchTransaction(connection)
 
     @staticmethod
     def _entity_from_row(row):
@@ -196,7 +212,133 @@ class SQLiteRepository:
                 (actor_id, idem_key, entity_id, utcnow()),
             )
 
+    def get_observation_batch(self, device_id, batch_no):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM observation_batches WHERE device_id = ? AND batch_no = ?",
+                (device_id, batch_no),
+            ).fetchone()
+        return self._batch_from_row(row) if row else None
+
+    @staticmethod
+    def _batch_from_row(row):
+        return {
+            "device_id": row["device_id"],
+            "batch_no": row["batch_no"],
+            "status": row["status"],
+            "response": json.loads(row["response"]),
+            "submitted_by": row["submitted_by"],
+            "created_at": row["created_at"],
+        }
+
     def ping(self):
         with self._connect() as connection:
             connection.execute("SELECT 1").fetchone()
         return True
+
+
+class _BatchTransaction:
+    """All-or-nothing context for one observation batch upload."""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.connection.commit()
+        else:
+            self.connection.rollback()
+        self.connection.close()
+        return False
+
+    def get_batch(self, device_id, batch_no):
+        row = self.connection.execute(
+            "SELECT * FROM observation_batches WHERE device_id = ? AND batch_no = ?",
+            (device_id, batch_no),
+        ).fetchone()
+        return SQLiteRepository._batch_from_row(row) if row else None
+
+    def observations_by_identity(self, identities):
+        if not identities:
+            return {}
+        # event_id/observed_at live in JSON data; extract with json_extract.
+        rows = self.connection.execute(
+            "SELECT * FROM entities WHERE kind = 'observation' AND ("
+            + " OR ".join(
+                ["(json_extract(data, '$.event_id') = ? AND json_extract(data, '$.observed_at') = ?)"]
+                * len(identities)
+            )
+            + ")",
+            [value for identity in identities for value in identity],
+        ).fetchall()
+        result = {}
+        for row in rows:
+            data = json.loads(row["data"])
+            result[(data.get("event_id"), data.get("observed_at"))] = (
+                SQLiteRepository._entity_from_row(row)
+            )
+        return result
+
+    def get_entity(self, entity_id):
+        row = self.connection.execute(
+            "SELECT * FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        return SQLiteRepository._entity_from_row(row) if row else None
+
+    def create_observation(self, payload, actor_id):
+        now = utcnow()
+        entity_id = str(payload.get("id") or uuid4())
+        data = {key: value for key, value in payload.items() if key != "id"}
+        self.connection.execute(
+            "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+            "VALUES (?, 'observation', 'captured', 1, ?, ?, ?, ?)",
+            (
+                entity_id,
+                json.dumps(data, ensure_ascii=False, sort_keys=True),
+                actor_id,
+                now,
+                now,
+            ),
+        )
+        self.connection.execute(
+            "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+            "VALUES (?, ?, ?, 'batch_create', NULL, 'captured', ?, ?)",
+            (
+                entity_id,
+                actor_id,
+                actor_id,
+                json.dumps(
+                    {"event_id": payload.get("event_id"), "observed_at": payload.get("observed_at")},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                now,
+            ),
+        )
+        return {
+            "id": entity_id,
+            "kind": "observation",
+            "status": "captured",
+            "version": 1,
+            "data": data,
+            "created_by": actor_id,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    def save_batch_result(self, device_id, batch_no, status, response, actor_id):
+        self.connection.execute(
+            "INSERT INTO observation_batches(device_id, batch_no, status, response, submitted_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                device_id,
+                batch_no,
+                status,
+                json.dumps(response, ensure_ascii=False, sort_keys=True),
+                actor_id,
+                utcnow(),
+            ),
+        )
