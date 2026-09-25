@@ -34,6 +34,35 @@ python3 app.py --db ./data.db --port 8305
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
 - `GET /api/audit`：读取审计记录。
+- `POST /api/batches`：巡护队离线观察整批回传。
+- `GET /api/batches/<device_id>/<batch_no>`：查询某设备批次的首次应答。
+
+### 离线批次回传规则
+
+请求体：
+
+```json
+{
+  "device_id": "D-001",
+  "batch_no": "B-20260925-01",
+  "observations": [
+    {"event_id": "E-1", "species": "麋鹿", "location": "北湖岸",
+     "observed_at": "2026-09-24", "lat": 30.12, "lon": 120.34}
+  ]
+}
+```
+
+- **幂等**：同一`device_id`+`batch_no`再次到达时，直接沿用第一次的应答
+  （包括首次被退回时的409应答），不会重复落库。
+- **同一条观察**：`event_id`相同且`observed_at`日期相同（忽略时分秒）。
+- 批内完全重复的观察折叠为一条；批内同键但内容不同则请求校验失败。
+- 与服务器已有观察内容相同：跳过（返回`skipped`及原因）。
+- 与服务器已有观察内容不同（例如补正过的物种或坐标）：**整批退回**，
+  HTTP 409，`conflicts`逐项列出上送版本与服务器版本（含`server_version`
+  和`server_entity_id`），无冲突的条目也不会部分写入。
+- 判定与写入在单个`BEGIN IMMEDIATE`事务内完成，退回时整批回滚；
+  只有受理成功或整批退回的批次才会保存应答，畸形请求不落应答。
+- 批次提交角色为`admin`/`field`。首页可直接提交批次JSON并查询结果。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
 
@@ -45,4 +74,4 @@ python3 -m unittest discover -s tests -v
 
 ## 局限
 
-离线同步使用批次和幂等键演示，不包含真实野外通信协议、地图底图或完整空间索引。
+离线批次回传覆盖幂等、批内去重、与服务器版本比对和整批事务，但不包含真实野外通信协议、地图底图或完整空间索引。

@@ -54,6 +54,15 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS batch_receipts (
+                    device_id TEXT NOT NULL,
+                    batch_no TEXT NOT NULL,
+                    status_code INTEGER NOT NULL,
+                    response TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(device_id, batch_no)
+                );
             """)
 
     @staticmethod
@@ -195,6 +204,99 @@ class SQLiteRepository:
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
             )
+
+    def begin_transaction(self):
+        """开启立即事务，调用方必须用 commit_transaction/rollback_transaction 收尾。"""
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        return connection
+
+    def tx_lookup(self, connection, kind, field, value):
+        """在同一事务连接内查询，能读到本事务已写入但尚未提交的数据。"""
+        rows = connection.execute(
+            "SELECT * FROM entities WHERE kind = ? ORDER BY created_at, id", (kind,)
+        ).fetchall()
+        result = []
+        for row in rows:
+            entity = self._entity_from_row(row)
+            if field == "id":
+                matched = entity["id"] == value
+            else:
+                matched = entity["data"].get(field) == value
+            if matched:
+                result.append(entity)
+        return result
+
+    def commit_transaction(self, connection):
+        connection.commit()
+        connection.close()
+
+    def rollback_transaction(self, connection):
+        connection.rollback()
+        connection.close()
+
+    def tx_insert_observation(self, connection, entity_id, data, actor_id):
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        connection.execute(
+            "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+            "VALUES (?, 'observation', 'captured', 1, ?, ?, ?, ?)",
+            (entity_id, payload, actor_id, now, now),
+        )
+
+    def tx_append_audit(self, connection, entity_id, actor_id, actor_role, detail):
+        connection.execute(
+            "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, "
+            "to_status, detail, created_at) VALUES (?, ?, ?, 'batch_create', NULL, 'captured', ?, ?)",
+            (
+                entity_id,
+                actor_id,
+                actor_role,
+                json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                utcnow(),
+            ),
+        )
+
+    def tx_save_batch_receipt(self, connection, device_id, batch_no, status_code, response, actor_id):
+        connection.execute(
+            "INSERT INTO batch_receipts(device_id, batch_no, status_code, response, actor_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                device_id,
+                batch_no,
+                status_code,
+                json.dumps(response, ensure_ascii=False, sort_keys=True),
+                actor_id,
+                utcnow(),
+            ),
+        )
+
+    def tx_get_batch_receipt(self, connection, device_id, batch_no):
+        row = connection.execute(
+            "SELECT status_code, response FROM batch_receipts "
+            "WHERE device_id = ? AND batch_no = ?",
+            (device_id, batch_no),
+        ).fetchone()
+        if not row:
+            return None
+        return {"status_code": int(row["status_code"]), "response": json.loads(row["response"])}
+
+    def get_batch_receipt(self, device_id, batch_no):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM batch_receipts WHERE device_id = ? AND batch_no = ?",
+                (device_id, batch_no),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "device_id": row["device_id"],
+            "batch_no": row["batch_no"],
+            "status_code": int(row["status_code"]),
+            "response": json.loads(row["response"]),
+            "actor_id": row["actor_id"],
+            "created_at": row["created_at"],
+        }
 
     def ping(self):
         with self._connect() as connection:

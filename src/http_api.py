@@ -85,6 +85,9 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if len(parts) == 4 and parts[:2] == ["api", "batches"]:
+                    status, payload = service.get_batch_result(parts[2], parts[3])
+                    return self._send(status, payload)
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -138,6 +141,8 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
                     )
+                if len(parts) == 2 and parts == ["api", "batches"]:
+                    return self._send(*service.submit_batch(actor, self._body()))
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     idem = self.headers.get("Idempotency-Key")
